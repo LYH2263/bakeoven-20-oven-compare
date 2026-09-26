@@ -38,6 +38,29 @@ class BatchCreate(BaseModel):
     code: str | None = None
 
 
+class PreviewConflict(BaseModel):
+    batch_id: int
+    code: str
+    phase: str
+    start_min: int
+    end_min: int
+
+
+class OvenPreview(BaseModel):
+    oven_id: int
+    oven_label: str
+    ferment_end: int
+    bake_end: int
+    available: bool
+    conflicts: list[PreviewConflict]
+
+
+class PreviewOut(BaseModel):
+    product_id: int
+    start_min: int
+    ovens: list[OvenPreview]
+
+
 class GanttBlock(BaseModel):
     batch_id: int
     code: str
