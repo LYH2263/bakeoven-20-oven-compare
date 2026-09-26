@@ -299,3 +299,20 @@ select, input, .gantt-deck button, .toolbar button {
   justify-content: space-between;
   font-family: "IBM Plex Mono", monospace;
 }
+
+/* 试排列表 */
+.preview-row--blocked td { color: #ff9b7a; }
+.preview-row--blocked .conflict-chip { align-self: flex-start; }
+.preview-conflicts {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: .35rem;
+  font-size: .82rem;
+}
+.toolbar button:disabled { opacity: .45; cursor: not-allowed; }
+input[type="radio"]:disabled { cursor: not-allowed; }
+h3 { margin: 1.1rem 0 .5rem; font-size: .98rem; color: var(--bake-muted); }
+.table .conflict-chip { width: fit-content; white-space: nowrap; }

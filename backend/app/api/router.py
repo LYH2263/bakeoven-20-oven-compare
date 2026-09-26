@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import JSONResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -7,9 +8,14 @@ from app.models.models import Batch, ConflictLog, Oven, Product
 from app.schemas.schemas import (
     BatchCreate,
     BatchOut,
+    ConflictItem,
     ConflictOut,
+    ConflictReject,
     GanttBlock,
     OvenOut,
+    PreviewOut,
+    PreviewOven,
+    PreviewRequest,
     ProductOut,
     WindowOut,
 )
@@ -22,6 +28,8 @@ from app.services.oven_engine import (
 )
 
 api_router = APIRouter()
+
+PHASE_LABELS = {"ferment": "发酵", "bake": "烘烤"}
 
 
 def _recipe(p: Product) -> RecipeDurations:
@@ -36,6 +44,56 @@ def _all_occupancies(db: Session) -> list[Occupancy]:
         if not p:
             continue
         out.extend(build_occupancies(b.oven_id, b.id, b.start_min, _recipe(p)))
+    return out
+
+
+def _batch_index(db: Session) -> dict[int, tuple[str, str | None]]:
+    """batch_id -> (code, product_name)，供冲突结果补对手信息。"""
+    index: dict[int, tuple[str, str | None]] = {}
+    for b in db.scalars(select(Batch)).all():
+        p = db.get(Product, b.product_id)
+        index[b.id] = (b.code, p.name if p else None)
+    return index
+
+
+def _conflict_item(
+    ex: Occupancy, cand: Occupancy, index: dict[int, tuple[str, str | None]]
+) -> ConflictItem:
+    code, pname = index.get(ex.batch_id, (f"#{ex.batch_id}", None))
+    return ConflictItem(
+        opponent_batch_id=ex.batch_id,
+        opponent_code=code,
+        opponent_product_name=pname,
+        opponent_phase=ex.phase,
+        opponent_phase_label=PHASE_LABELS.get(ex.phase, ex.phase),
+        opponent_start_min=ex.interval.start,
+        opponent_end_min=ex.interval.end,
+        candidate_phase=cand.phase,
+        candidate_phase_label=PHASE_LABELS.get(cand.phase, cand.phase),
+        candidate_start_min=cand.interval.start,
+        candidate_end_min=cand.interval.end,
+    )
+
+
+def _dedup_hits(
+    hits: list[tuple[Occupancy, Occupancy]],
+) -> list[tuple[Occupancy, Occupancy]]:
+    """按对手批次/阶段与候选区间保序去重。"""
+    seen: set[tuple] = set()
+    out: list[tuple[Occupancy, Occupancy]] = []
+    for ex, cand in hits:
+        key = (
+            ex.batch_id,
+            ex.phase,
+            ex.interval.start,
+            ex.interval.end,
+            cand.phase,
+            cand.interval.start,
+            cand.interval.end,
+        )
+        if key not in seen:
+            seen.add(key)
+            out.append((ex, cand))
     return out
 
 
@@ -79,7 +137,37 @@ def batches(db: Session = Depends(get_db)):
     return [_batch_out(db, b) for b in rows]
 
 
-@api_router.post("/batches", response_model=BatchOut)
+@api_router.post("/batches/preview", response_model=PreviewOut)
+def preview_batches(body: PreviewRequest, db: Session = Depends(get_db)):
+    product = db.get(Product, body.product_id)
+    if not product:
+        raise HTTPException(404, "产品不存在")
+    recipe = _recipe(product)
+    existing = _all_occupancies(db)
+    index = _batch_index(db)
+    ovens: list[PreviewOven] = []
+    for oven in db.scalars(select(Oven).order_by(Oven.id)).all():
+        cands = build_occupancies(oven.id, -1, body.start_min, recipe)
+        hits = _dedup_hits(find_conflicts(existing, cands))
+        ovens.append(
+            PreviewOven(
+                oven_id=oven.id,
+                oven_label=oven.label,
+                ferment_end=cands[0].interval.end,
+                bake_end=cands[1].interval.end,
+                available=not hits,
+                conflicts=[_conflict_item(ex, cand, index) for ex, cand in hits],
+            )
+        )
+    return PreviewOut(
+        product_id=product.id,
+        product_name=product.name,
+        start_min=body.start_min,
+        ovens=ovens,
+    )
+
+
+@api_router.post("/batches", response_model=BatchOut, responses={409: {"model": ConflictReject}})
 def create_batch(body: BatchCreate, db: Session = Depends(get_db)):
     product = db.get(Product, body.product_id)
     oven = db.get(Oven, body.oven_id)
@@ -88,17 +176,18 @@ def create_batch(body: BatchCreate, db: Session = Depends(get_db)):
     recipe = _recipe(product)
     candidates = build_occupancies(oven.id, -1, body.start_min, recipe)
     existing = _all_occupancies(db)
-    hits = find_conflicts(existing, candidates)
-    code = body.code or f"BO-{body.start_min}"
+    hits = _dedup_hits(find_conflicts(existing, candidates))
     if hits:
-        ex, cand = hits[0]
-        detail = (
-            f"与批次#{ex.batch_id} 的 {ex.phase} 段重叠："
-            f"[{cand.interval.start},{cand.interval.end})"
+        index = _batch_index(db)
+        reject = ConflictReject(
+            detail="提交时炉位已被占用，本批未保存，请重新试排",
+            oven_id=oven.id,
+            oven_label=oven.label,
+            start_min=body.start_min,
+            conflicts=[_conflict_item(ex, cand, index) for ex, cand in hits],
         )
-        db.add(ConflictLog(batch_code=code, oven_id=oven.id, detail=detail))
-        db.commit()
-        raise HTTPException(409, detail)
+        return JSONResponse(status_code=409, content=reject.model_dump())
+    code = body.code or f"BO-{body.start_min}"
     batch = Batch(
         product_id=product.id,
         oven_id=oven.id,
